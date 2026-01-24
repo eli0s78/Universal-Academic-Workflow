@@ -1,0 +1,5 @@
+{
+  "name": "Universal Academic Workflow V.5",
+  "description": "A web application to automate academic writing tasks using a multi-phase, AI-powered workflow. Users can configure tasks like outline generation, chapter writing, and critical reviews, and interact with the AI through a guided, step-by-step process.",
+  "requestFramePermissions": []
+}
