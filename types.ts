@@ -1,17 +1,23 @@
 
-
 export enum TaskType {
+  PROJECT_DEFINITION = "PROJECT_DEFINITION",
   OUTLINE_GENERATION = "OUTLINE_GENERATION",
   CHAPTER_GENERATION = "CHAPTER_GENERATION",
   CHAPTER_RECONSTRUCTION = "CHAPTER_RECONSTRUCTION",
   BOOK_TO_CHAPTER_TRANSMUTATION = "BOOK_TO_CHAPTER_TRANSMUTATION",
   CHAPTER_INFUSION = "CHAPTER_INFUSION",
   ACADEMIC_NOTE_GENERATION = "ACADEMIC_NOTE_GENERATION",
+  CONTEXT_PROCESSING = "CONTEXT_PROCESSING",
   RED_TEAM_REVIEW = "RED_TEAM_REVIEW",
+  CITATION_VERIFICATION = "CITATION_VERIFICATION",
   FINAL_SYNTHESIS = "FINAL_SYNTHESIS"
 }
 
 export type Phase = 'generation' | 'review' | 'synthesis'; // Legacy type, kept for compatibility if needed, but mostly replaced by Node Type
+
+export enum ProjectInputType {
+  MANUAL_ENTRY = "MANUAL_ENTRY"
+}
 
 export enum OutlineInputType {
   TITLE_ONLY = "TITLE_ONLY",
@@ -40,9 +46,17 @@ export enum AcademicNoteInputType {
   FILES_AND_TITLE = "FILES_AND_TITLE"
 }
 
+export enum ContextProcessingInputType {
+  FILES_ONLY = "FILES_ONLY"
+}
+
 export enum RedTeamInputType {
   DRAFT_CHAPTER = "DRAFT_CHAPTER",
   DRAFT_CHAPTER_AND_BIBLIOGRAPHY = "DRAFT_CHAPTER_AND_BIBLIOGRAPHY"
+}
+
+export enum CitationVerificationInputType {
+  DRAFT_CHAPTER = "DRAFT_CHAPTER"
 }
 
 export enum FinalSynthesisInputType {
@@ -50,7 +64,7 @@ export enum FinalSynthesisInputType {
   DRAFT_AND_RED_TEAM_REVIEW_AND_BIBLIOGRAPHY = "DRAFT_AND_RED_TEAM_REVIEW_AND_BIBLIOGRAPHY"
 }
 
-export type InputType = OutlineInputType | ChapterGenInputType | ChapterReconInputType | BookToChapterInputType | ChapterInfusionInputType | AcademicNoteInputType | RedTeamInputType | FinalSynthesisInputType;
+export type InputType = ProjectInputType | OutlineInputType | ChapterGenInputType | ChapterReconInputType | BookToChapterInputType | ChapterInfusionInputType | AcademicNoteInputType | ContextProcessingInputType | RedTeamInputType | CitationVerificationInputType | FinalSynthesisInputType;
 
 
 export enum ResearchRequirement {
@@ -142,6 +156,12 @@ export interface ChapterSection {
   protocol?: string;
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  responseTokens: number;
+  totalTokens: number;
+}
+
 // --- NODE ARCHITECTURE TYPES ---
 
 export interface WorkflowNode {
@@ -165,4 +185,5 @@ export interface NodeExecutionState {
   documentSections: ChapterSection[];
   elapsedTime: number;
   logs: string[];
+  tokenUsage: TokenUsage;
 }

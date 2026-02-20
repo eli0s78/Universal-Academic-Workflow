@@ -1,9 +1,9 @@
 
-
+// Main App component for the Universal Academic Workflow
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { GenerateContentResponse } from "@google/genai";
-import { Config, Message, WorkflowState, TaskType, WorkflowNode, WorkflowEdge, NodeExecutionState, SectionVersion, ChapterSection, AnalysisLevel, InputType } from './types';
+// import { GenerateContentResponse } from "@google/genai";
+import { Config, Message, WorkflowState, TaskType, WorkflowNode, WorkflowEdge, NodeExecutionState, SectionVersion, ChapterSection, AnalysisLevel, InputType, ContextProcessingInputType, TokenUsage, ProjectInputType } from './types';
 import { startGenerationPhase, executeReviewPhase, executeSynthesisPhase, continueWorkflow, extractRelevantContent } from './services/geminiService';
 import NodeCanvas from './components/NodeCanvas';
 import NodeConfigurator from './components/NodeConfigurator';
@@ -16,7 +16,7 @@ const LOCAL_STORAGE_KEY = 'universal_academic_workflow_nodes_v1';
 
 const getInitialConfig = (type: TaskType): Config => ({
     Task_Type: type,
-    Input_Type: '', // Needs to be set based on defaults
+    Input_Type: type === TaskType.PROJECT_DEFINITION ? ProjectInputType.MANUAL_ENTRY : (type === TaskType.CONTEXT_PROCESSING ? ContextProcessingInputType.FILES_ONLY : ''), 
     Research_Requirement: '',
     Analysis_Level: AnalysisLevel.FOCUSED_BALANCE,
     Target_Word_Count: '',
@@ -43,7 +43,8 @@ const getInitialExecutionState = (): NodeExecutionState => ({
     workflowState: WorkflowState.CONFIGURING,
     documentSections: [],
     elapsedTime: 0,
-    logs: []
+    logs: [],
+    tokenUsage: { promptTokens: 0, responseTokens: 0, totalTokens: 0 }
 });
 
 const extractTitleFromMarkdown = (content: string): string => {
@@ -90,6 +91,12 @@ function App() {
     const [executionStates, setExecutionStates] = useState<Record<string, NodeExecutionState>>({});
     const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
     
+    // Panel Resizing State
+    const [leftWidth, setLeftWidth] = useState(384); // Default 384px (w-96)
+    const [rightWidth, setRightWidth] = useState(500); // Default 500px
+    const [isResizingLeft, setIsResizingLeft] = useState(false);
+    const [isResizingRight, setIsResizingRight] = useState(false);
+
     // Timer Refs
     const timerRefs = useRef<Record<string, number | null>>({});
     const startTimesRef = useRef<Record<string, number | null>>({});
@@ -111,6 +118,10 @@ function App() {
                             states[key].documentSections.forEach((sec: ChapterSection) => {
                                 sec.versions.forEach((v: SectionVersion) => v.createdAt = new Date(v.createdAt));
                             });
+                        }
+                        // Ensure tokenUsage exists for legacy saves
+                        if (!states[key].tokenUsage) {
+                            states[key].tokenUsage = { promptTokens: 0, responseTokens: 0, totalTokens: 0 };
                         }
                     });
                     setExecutionStates(states);
@@ -191,6 +202,52 @@ function App() {
         return () => clearTimeout(timeoutId);
     }, [nodes, edges, executionStates]);
 
+    // --- Resizing Logic ---
+    const startResizingLeft = useCallback(() => setIsResizingLeft(true), []);
+    const startResizingRight = useCallback(() => setIsResizingRight(true), []);
+    
+    const stopResizing = useCallback(() => {
+        setIsResizingLeft(false);
+        setIsResizingRight(false);
+    }, []);
+
+    const resize = useCallback((mouseEvent: MouseEvent) => {
+        if (isResizingLeft) {
+            setLeftWidth(current => {
+                const newWidth = mouseEvent.clientX;
+                if (newWidth < 280) return 280;
+                if (newWidth > 600) return 600;
+                return newWidth;
+            });
+        }
+        if (isResizingRight) {
+            setRightWidth(current => {
+                const newWidth = window.innerWidth - mouseEvent.clientX;
+                if (newWidth < 350) return 350;
+                if (newWidth > 900) return 900;
+                return newWidth;
+            });
+        }
+    }, [isResizingLeft, isResizingRight]);
+
+    useEffect(() => {
+        if (isResizingLeft || isResizingRight) {
+            window.addEventListener('mousemove', resize);
+            window.addEventListener('mouseup', stopResizing);
+            document.body.style.userSelect = 'none';
+            document.body.style.cursor = 'col-resize';
+        } else {
+             document.body.style.userSelect = '';
+             document.body.style.cursor = '';
+        }
+        return () => {
+            window.removeEventListener('mousemove', resize);
+            window.removeEventListener('mouseup', stopResizing);
+            document.body.style.userSelect = '';
+            document.body.style.cursor = '';
+        };
+    }, [isResizingLeft, isResizingRight, resize, stopResizing]);
+
     // --- Node Operations ---
 
     const handleAddNode = useCallback((type: TaskType, position: { x: number, y: number }) => {
@@ -227,6 +284,10 @@ function App() {
             if (prev.some(e => e.source === source && e.target === target)) return prev;
             return [...prev, { id: uuidv4(), source, target }];
         });
+    }, []);
+
+    const handleDeleteEdge = useCallback((edgeId: string) => {
+        setEdges(prev => prev.filter(e => e.id !== edgeId));
     }, []);
 
     const handleUpdateConfig = useCallback((nodeId: string, newConfig: Partial<Config>) => {
@@ -271,53 +332,117 @@ function App() {
     };
 
     // --- Artifact/Context Integration ---
-    // This function looks for upstream nodes and pulls their artifacts into the current config
-    // It returns the effective config AND metadata about where the data came from
     const getUpstreamContext = useCallback((node: WorkflowNode) => {
         const incomingEdges = edges.filter(e => e.target === node.id);
         const effectiveConfig = { ...node.config };
         const upstreamSources: Record<string, string> = {};
 
-        // Simple Heuristic for Data Flow:
-        // If Outline -> Chapter: Put Outline Output into 'Chapter_Outline'
-        // If Chapter -> Review: Put Chapter Output into 'Draft_Chapter_Text'
-        // If Review -> Synthesis: Put Review Output into 'Red_Team_Review_Text' AND Chapter Output into 'Draft_Chapter_Text' (needs to trace back)
+        // Accumulators for multi-source nodes
+        let combinedSourceB = effectiveConfig.Source_B_Content || '';
+        let combinedBibliography = effectiveConfig.Core_Bibliography || '';
 
         incomingEdges.forEach(edge => {
             const sourceNode = nodes.find(n => n.id === edge.source);
             const sourceState = executionStates[edge.source];
             if (!sourceNode || !sourceState) return;
             
-            // Assemble source artifacts
+            // Get text from artifacts (document sections)
             const sourceText = sourceState.documentSections
                 .sort((a,b) => a.order - b.order)
                 .map(s => s.versions.find(v => v.id === s.activeVersionId)?.content || '')
                 .join('\n\n');
             
-            // Pass forward already processed bibliography data to reuse tokenization
-            // If the downstream node doesn't have a bib loaded but the upstream did, reuse it.
-            if (sourceNode.config.Core_Bibliography && !effectiveConfig.Core_Bibliography) {
-                effectiveConfig.Core_Bibliography = sourceNode.config.Core_Bibliography;
-                upstreamSources['Core_Bibliography'] = sourceNode.label || sourceNode.type;
-            }
+            // Get raw chat message content if no artifacts (fallback for Context Processing)
+            const sourceChatContent = sourceState.messages
+                .filter(m => m.role === 'assistant' && !m.isHidden)
+                .map(m => m.content)
+                .join('\n\n');
 
-            if (!sourceText) return;
-
-            // Logic mapping
+            const contentToUse = sourceText || sourceChatContent;
             const sType = sourceNode.type;
             const tType = node.type;
 
+            // --- PROJECT DEFINITION INHERITANCE (METADATA) ---
+            if (sType === TaskType.PROJECT_DEFINITION) {
+                // All downstream nodes inherit metadata from Project Definition
+                if (sourceNode.config.Chapter_Title) {
+                    effectiveConfig.Chapter_Title = sourceNode.config.Chapter_Title;
+                    upstreamSources['Chapter_Title'] = "Project Definition";
+                }
+                if (sourceNode.config.Chapter_Subtitle) {
+                    effectiveConfig.Chapter_Subtitle = sourceNode.config.Chapter_Subtitle;
+                }
+                if (sourceNode.config.Additional_Instructions) {
+                    // Append instructions or set if empty
+                    const existing = effectiveConfig.Additional_Instructions || '';
+                    effectiveConfig.Additional_Instructions = existing 
+                        ? `${existing}\n\nGlobal Project Directives:\n${sourceNode.config.Additional_Instructions}`
+                        : sourceNode.config.Additional_Instructions;
+                }
+                if (sourceNode.config.Target_Word_Count) effectiveConfig.Target_Word_Count = sourceNode.config.Target_Word_Count;
+                if (sourceNode.config.Output_Language) effectiveConfig.Output_Language = sourceNode.config.Output_Language;
+            }
+
+            // --- CONTEXT PROCESSING INHERITANCE (DATA) ---
+            else if (sType === TaskType.CONTEXT_PROCESSING) {
+                // WE USE XML TAGS to help the model distinguish sources and prevent "overload confusion"
+                const label = sourceNode.label || "Context_Batch";
+                const safeLabel = label.replace(/\s+/g, '_');
+                
+                // Structured XML Block
+                const structuredBlock = `
+<context_source id="${safeLabel}" type="context_processing_output">
+${contentToUse}
+</context_source>
+`;
+                // Append to BOTH bibliography and Source B content
+                combinedBibliography += structuredBlock;
+                combinedSourceB += structuredBlock;
+                
+                upstreamSources['Core_Bibliography'] = "Context Library";
+                upstreamSources['Source_B_Content'] = "Context Library";
+                
+                // Note: We deliberately do NOT inherit title from Context Processing nodes anymore,
+                // as the Project Definition node is now the single source of truth for Titles.
+            }
+            
+            // --- STANDARD NODE INHERITANCE ---
+            else if (sourceNode.config.Core_Bibliography && !effectiveConfig.Core_Bibliography) {
+                if (!combinedBibliography.includes("context_source")) {
+                     effectiveConfig.Core_Bibliography = sourceNode.config.Core_Bibliography;
+                     upstreamSources['Core_Bibliography'] = sourceNode.label || sourceNode.type;
+                }
+            }
+            
+            // General fallback inheritance for non-Project nodes
+            if (sType !== TaskType.PROJECT_DEFINITION) {
+                if (!effectiveConfig.Chapter_Title && sourceNode.config.Chapter_Title) {
+                     effectiveConfig.Chapter_Title = sourceNode.config.Chapter_Title;
+                     upstreamSources['Chapter_Title'] = sourceNode.label || sourceNode.type;
+                }
+                if (!effectiveConfig.Chapter_Subtitle && sourceNode.config.Chapter_Subtitle) {
+                     effectiveConfig.Chapter_Subtitle = sourceNode.config.Chapter_Subtitle;
+                }
+            }
+
+            // Inherit Outline for Context Processing context-aware extraction
+            if (tType === TaskType.CONTEXT_PROCESSING && !effectiveConfig.Chapter_Outline && contentToUse && sType === TaskType.OUTLINE_GENERATION) {
+                 effectiveConfig.Chapter_Outline = contentToUse;
+                 upstreamSources['Chapter_Outline'] = sourceNode.label || sourceNode.type;
+            }
+
+            if (!contentToUse) return;
+
             if (sType === TaskType.OUTLINE_GENERATION && tType === TaskType.CHAPTER_GENERATION) {
-                effectiveConfig.Chapter_Outline = sourceText;
+                effectiveConfig.Chapter_Outline = contentToUse;
                 upstreamSources['Chapter_Outline'] = sourceNode.label || sourceNode.type;
-            } else if (tType === TaskType.RED_TEAM_REVIEW) {
-                // Assume incoming is draft
-                effectiveConfig.Draft_Chapter_Text = sourceText;
+            } else if (tType === TaskType.RED_TEAM_REVIEW || tType === TaskType.CITATION_VERIFICATION) {
+                // Accepts text from any upstream node as the draft to be reviewed/verified
+                effectiveConfig.Draft_Chapter_Text = contentToUse;
                 upstreamSources['Draft_Chapter_Text'] = sourceNode.label || sourceNode.type;
             } else if (sType === TaskType.RED_TEAM_REVIEW && tType === TaskType.FINAL_SYNTHESIS) {
-                effectiveConfig.Red_Team_Review_Text = sourceText;
+                effectiveConfig.Red_Team_Review_Text = contentToUse;
                 upstreamSources['Red_Team_Review_Text'] = sourceNode.label || sourceNode.type;
-                // Try to find the draft that fed the review
                 const draftEdge = edges.find(e => e.target === sourceNode.id);
                 if (draftEdge) {
                      const draftNodeId = draftEdge.source;
@@ -329,20 +454,16 @@ function App() {
                         upstreamSources['Draft_Chapter_Text'] = draftNode?.label || draftNode?.type || 'Upstream Draft';
                      }
                 }
-            } else if (tType === TaskType.ACADEMIC_NOTE_GENERATION) {
-                 // Append to sources or treat as context - map to Source_B_Content for ingestion
-                 const prevContent = effectiveConfig.Source_B_Content || '';
-                 const separator = prevContent ? '\n\n' : '';
-                 effectiveConfig.Source_B_Content = `${prevContent}${separator}--- Input from ${TaskType[sType]} ---\n${sourceText}`;
+            } else if (tType === TaskType.ACADEMIC_NOTE_GENERATION && sType !== TaskType.PROJECT_DEFINITION) {
+                 const separator = combinedSourceB ? '\n\n' : '';
+                 combinedSourceB = `${combinedSourceB}${separator}--- Input from ${TaskType[sType]} ---\n${contentToUse}`;
                  upstreamSources['Source_B_Content'] = sourceNode.label || sourceNode.type;
-
-                 // Inherit Title if missing
-                 if (!effectiveConfig.Chapter_Title && sourceNode.config.Chapter_Title) {
-                     effectiveConfig.Chapter_Title = sourceNode.config.Chapter_Title;
-                     upstreamSources['Chapter_Title'] = sourceNode.label || sourceNode.type;
-                 }
             }
         });
+
+        // Apply accumulated values
+        if (combinedSourceB) effectiveConfig.Source_B_Content = combinedSourceB;
+        if (combinedBibliography) effectiveConfig.Core_Bibliography = combinedBibliography;
 
         return { effectiveConfig, upstreamSources };
     }, [nodes, edges, executionStates]);
@@ -351,25 +472,25 @@ function App() {
         const node = nodes.find(n => n.id === nodeId);
         if (!node) return;
 
-        // Update status
         setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, status: 'running' } : n));
         updateExecutionState(nodeId, { workflowState: WorkflowState.PROCESSING });
         startTimer(nodeId);
 
         try {
-            // Prepare Config with Upstream Data
             const { effectiveConfig: runConfig } = getUpstreamContext(node);
+            let accumulatedTokens: TokenUsage = { promptTokens: 0, responseTokens: 0, totalTokens: 0 };
             
-            // Pre-processing (Bib/Files)
-            // Reuse existing processed Core_Bibliography if available in runConfig (from prepareContextForNode)
-            // Otherwise, process from files.
+            // Special handling for CONTEXT_PROCESSING to ensure files are processed even if "Source_B_Files" is populated
+            if (node.type === TaskType.CONTEXT_PROCESSING && runConfig.Source_B_Files && runConfig.Source_B_Files.length > 0) {
+                 // Intentional no-op: files are processed in the block below
+            }
+
             if (runConfig.Core_Bibliography_Files && runConfig.Core_Bibliography_Files.length > 0 && !runConfig.Core_Bibliography) {
-                // Build a strict context for Eco-Scan based on Title and Subtitle
                 const contextTitle = runConfig.Chapter_Title || '';
                 const contextSubtitle = runConfig.Chapter_Subtitle || '';
                 const fullContext = `${contextTitle} ${contextSubtitle}`.trim();
 
-                const bibContent = await extractRelevantContent(
+                const { text: bibContent, usage: bibUsage } = await extractRelevantContent(
                     runConfig.Core_Bibliography_Files, 
                     { 
                         contextText: fullContext || 'Academic Context',
@@ -379,28 +500,36 @@ function App() {
                 );
                 
                 runConfig.Core_Bibliography = bibContent;
-                // Update local config too so we don't re-process next time
                 handleUpdateConfig(nodeId, { Core_Bibliography: bibContent });
+                
+                accumulatedTokens.promptTokens += bibUsage.promptTokens;
+                accumulatedTokens.responseTokens += bibUsage.responseTokens;
+                accumulatedTokens.totalTokens += bibUsage.totalTokens;
             } else if (runConfig.Core_Bibliography && !node.config.Core_Bibliography) {
-                // PROPAGATION FIX: Persist inherited bibliography to this node so downstream nodes can inherit it
                 handleUpdateConfig(nodeId, { Core_Bibliography: runConfig.Core_Bibliography });
             }
 
-            // Process Source_B_Files for Academic Note Generation AND Chapter Infusion
-            // FIX: Added Chapter Infusion type check to ensure secondary files are processed
-            if ((node.type === TaskType.ACADEMIC_NOTE_GENERATION || node.type === TaskType.CHAPTER_INFUSION) && runConfig.Source_B_Files && runConfig.Source_B_Files.length > 0) {
-                 
+            if ((node.type === TaskType.ACADEMIC_NOTE_GENERATION || node.type === TaskType.CHAPTER_INFUSION || node.type === TaskType.CONTEXT_PROCESSING) && runConfig.Source_B_Files && runConfig.Source_B_Files.length > 0) {
                  let contextInfo = runConfig.Chapter_Title || 'Academic Content';
                  
-                 // For Chapter Infusion, try to use the Primary Source content (or a snippet of it) as the context 
-                 // to guide the extraction of secondary files.
                  if (node.type === TaskType.CHAPTER_INFUSION && runConfig.Source_A_File) {
                      contextInfo = `Primary Source Content Preview (for Infusion context): ${runConfig.Source_A_File.slice(0, 500)}...`;
                  } else if (node.type === TaskType.ACADEMIC_NOTE_GENERATION) {
                      contextInfo = runConfig.Chapter_Title || 'Academic Note Generation';
+                 } else if (node.type === TaskType.CONTEXT_PROCESSING) {
+                     // Smart Context Extraction Logic: Uses inherited Title (from Project Node) to filter files
+                     const title = runConfig.Chapter_Title || '';
+                     const subtitle = runConfig.Chapter_Subtitle || '';
+                     const outline = runConfig.Chapter_Outline || '';
+                     
+                     if (title || subtitle) {
+                        contextInfo = `Context: ${title} ${subtitle}\n${outline ? `Outline Scope:\n${outline}` : ''}`;
+                     } else {
+                        contextInfo = 'Knowledge Base Extraction (General)';
+                     }
                  }
 
-                 const fileContent = await extractRelevantContent(
+                 const { text: fileContent, usage: fileUsage } = await extractRelevantContent(
                     runConfig.Source_B_Files,
                     { 
                         contextText: contextInfo,
@@ -409,23 +538,23 @@ function App() {
                     runConfig.Analysis_Level
                  );
                  
-                 // Append file content to existing Source_B_Content (which might have upstream data)
                  const existing = runConfig.Source_B_Content || '';
                  runConfig.Source_B_Content = existing ? `${existing}\n\n${fileContent}` : fileContent;
+                 
+                 accumulatedTokens.promptTokens += fileUsage.promptTokens;
+                 accumulatedTokens.responseTokens += fileUsage.responseTokens;
+                 accumulatedTokens.totalTokens += fileUsage.totalTokens;
             }
 
-            // Phase Mappings for Service
-            let responsePayload: { userPrompt: string, response: GenerateContentResponse };
+            let responsePayload: { userPrompt: string, response: any };
 
-            // Execute based on type
             if (node.type === TaskType.RED_TEAM_REVIEW) {
-                runConfig.Final_Draft_For_Review = runConfig.Draft_Chapter_Text; // Legacy mapping
+                runConfig.Final_Draft_For_Review = runConfig.Draft_Chapter_Text; 
                 responsePayload = await executeReviewPhase(runConfig, nodeId);
             } else if (node.type === TaskType.FINAL_SYNTHESIS) {
-                runConfig.Final_Draft_For_Review = runConfig.Draft_Chapter_Text; // Legacy mapping
+                runConfig.Final_Draft_For_Review = runConfig.Draft_Chapter_Text; 
                 responsePayload = await executeSynthesisPhase(runConfig, nodeId);
             } else {
-                // Generation tasks
                 responsePayload = await startGenerationPhase(runConfig, nodeId);
             }
 
@@ -433,6 +562,14 @@ function App() {
             const responseText = (responsePayload.response.text as string | undefined) ?? '';
             const { cleanedText, isAwaitingAction } = processResponseText(responseText);
             const groundingMetadata = (responsePayload.response.candidates?.[0] as any)?.groundingMetadata;
+            
+            // Add usage from the main call
+            const usageMeta = responsePayload.response.usageMetadata;
+            if (usageMeta) {
+                accumulatedTokens.promptTokens += usageMeta.promptTokenCount || 0;
+                accumulatedTokens.responseTokens += usageMeta.candidatesTokenCount || 0;
+                accumulatedTokens.totalTokens += usageMeta.totalTokenCount || 0;
+            }
 
             updateExecutionState(nodeId, prev => {
                  const newMessages = [...prev.messages];
@@ -447,9 +584,41 @@ function App() {
                      duration,
                      protocol: node.type
                  });
+                 
+                 // Update tokens
+                 const updatedTokens = {
+                     promptTokens: prev.tokenUsage.promptTokens + accumulatedTokens.promptTokens,
+                     responseTokens: prev.tokenUsage.responseTokens + accumulatedTokens.responseTokens,
+                     totalTokens: prev.tokenUsage.totalTokens + accumulatedTokens.totalTokens
+                 };
+
+                 // --- AUTO-POPULATE ARTIFACTS FOR CITATION VERIFICATION ---
+                 let updatedSections = prev.documentSections;
+                 if (node.type === TaskType.CITATION_VERIFICATION && runConfig.Draft_Chapter_Text && prev.documentSections.length === 0) {
+                     const sectionId = uuidv4();
+                     const versionId = uuidv4();
+                     updatedSections = [{
+                         id: sectionId,
+                         order: 1,
+                         title: "Draft Chapter (For Verification)",
+                         versions: [{
+                             id: versionId,
+                             content: runConfig.Draft_Chapter_Text,
+                             createdAt: new Date(),
+                             source: 'ai-generated'
+                         }],
+                         activeVersionId: versionId,
+                         sourceMessageId: 'upstream-import',
+                         protocol: node.type
+                     }];
+                 }
+                 // ----------------------------------------------------------
+
                  return { 
                      messages: newMessages, 
-                     workflowState: isAwaitingAction ? WorkflowState.AWAITING_USER_ACTION : WorkflowState.COMPLETED 
+                     workflowState: isAwaitingAction ? WorkflowState.AWAITING_USER_ACTION : WorkflowState.COMPLETED,
+                     tokenUsage: updatedTokens,
+                     documentSections: updatedSections
                  };
             });
             
@@ -483,10 +652,22 @@ function App() {
             const duration = stopTimer(nodeId);
             const responseText = response.text ?? '';
             const { cleanedText, isAwaitingAction } = processResponseText(responseText);
+            
+            const usageMeta = response.usageMetadata;
+            const newTokens: TokenUsage = {
+                promptTokens: usageMeta?.promptTokenCount || 0,
+                responseTokens: usageMeta?.candidatesTokenCount || 0,
+                totalTokens: usageMeta?.totalTokenCount || 0
+            };
 
             updateExecutionState(nodeId, prev => ({
                 messages: [...prev.messages, { id: uuidv4(), role: 'assistant', content: cleanedText, duration, protocol: node?.type }],
-                workflowState: isAwaitingAction ? WorkflowState.AWAITING_USER_ACTION : WorkflowState.COMPLETED
+                workflowState: isAwaitingAction ? WorkflowState.AWAITING_USER_ACTION : WorkflowState.COMPLETED,
+                tokenUsage: {
+                    promptTokens: prev.tokenUsage.promptTokens + newTokens.promptTokens,
+                    responseTokens: prev.tokenUsage.responseTokens + newTokens.responseTokens,
+                    totalTokens: prev.tokenUsage.totalTokens + newTokens.totalTokens
+                }
             }));
              setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, status: isAwaitingAction ? 'running' : 'completed' } : n));
         } catch (error) {
@@ -543,7 +724,6 @@ function App() {
     // --- Global Actions ---
     
     const resetProject = useCallback(() => {
-        // Stop any active timers
         Object.keys(timerRefs.current).forEach(key => {
             if (timerRefs.current[key]) clearInterval(timerRefs.current[key]!);
         });
@@ -554,7 +734,6 @@ function App() {
         setEdges([]);
         setExecutionStates({});
         setSelectedNodeId(null);
-        // Clear local storage explicitly
         localStorage.removeItem(LOCAL_STORAGE_KEY);
     }, []);
 
@@ -591,7 +770,13 @@ function App() {
                     const parsed = JSON.parse(re.target?.result as string);
                     if (parsed.nodes) setNodes(parsed.nodes);
                     if (parsed.edges) setEdges(parsed.edges);
-                    if (parsed.executionStates) setExecutionStates(parsed.executionStates);
+                    if (parsed.executionStates) {
+                        // Ensure TokenUsage compatibility for old saves
+                        Object.values(parsed.executionStates).forEach((state: any) => {
+                            if (!state.tokenUsage) state.tokenUsage = { promptTokens: 0, responseTokens: 0, totalTokens: 0 };
+                        });
+                        setExecutionStates(parsed.executionStates);
+                    }
                 } catch (err) {
                     alert("Invalid workflow file");
                 }
@@ -606,10 +791,14 @@ function App() {
     
     const upstreamContext = selectedNode ? getUpstreamContext(selectedNode) : { effectiveConfig: {}, upstreamSources: {} };
 
+    // Dynamic classes based on resizing state to prevent lag
+    const leftTransitionClass = isResizingLeft ? '' : 'transition-[width,opacity] duration-300 ease-in-out';
+    const rightTransitionClass = isResizingRight ? '' : 'transition-[width,opacity] duration-300 ease-in-out';
+
     return (
         <div className="flex flex-col h-screen w-screen bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 overflow-hidden relative">
             {/* Top Menu Bar */}
-            <div className="h-12 flex-shrink-0 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center justify-between px-4">
+            <div className="h-12 flex-shrink-0 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center justify-between px-4 z-20 relative">
                 <div className="font-bold text-lg flex items-center gap-2">
                     <span className="bg-indigo-600 text-white p-1 rounded">UA</span>
                     <span>Universal Academic Workflow</span>
@@ -622,57 +811,83 @@ function App() {
             </div>
 
             {/* Main Workspace */}
-            <div className="flex-1 flex overflow-hidden">
-                {/* Left Panel: Properties (Fixed or Conditional) */}
-                <div className={`flex-shrink-0 w-80 md:w-96 border-r border-slate-200 dark:border-slate-800 transition-all ${!selectedNode ? 'w-0 opacity-0 overflow-hidden' : 'opacity-100'}`}>
-                    {selectedNode && (
-                        <NodeConfigurator 
-                            node={selectedNode}
-                            upstreamSources={upstreamContext.upstreamSources}
-                            inheritedConfig={upstreamContext.effectiveConfig}
-                            onUpdateConfig={handleUpdateConfig}
-                            onRunNode={handleRunNode}
-                            isNodeRunning={selectedNode.status === 'running'}
-                        />
-                    )}
-                </div>
-
-                {/* Center: Canvas */}
-                <div className="flex-1 relative z-0">
+            <div className="flex-1 relative overflow-hidden">
+                {/* Canvas (Bottom Layer) */}
+                <div className="absolute inset-0 z-0">
                     <NodeCanvas 
                         nodes={nodes}
                         edges={edges}
                         selectedNodeId={selectedNodeId}
+                        executionStates={executionStates}
                         onNodeSelect={setSelectedNodeId}
                         onNodeMove={handleMoveNode}
                         onAddNode={handleAddNode}
                         onDeleteNode={handleDeleteNode}
                         onConnect={handleConnect}
+                        onDeleteEdge={handleDeleteEdge}
                     />
                     {!selectedNode && nodes.length === 0 && (
                         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                             <div className="bg-white/80 dark:bg-slate-800/80 p-6 rounded-xl shadow-xl text-center backdrop-blur-sm pointer-events-auto border border-slate-200 dark:border-slate-700">
                                 <PlusCircleIcon className="w-12 h-12 mx-auto text-indigo-500 mb-2"/>
                                 <h3 className="text-lg font-bold">Start your workflow</h3>
-                                <p className="text-slate-500 mb-4">Right-click on the canvas to add your first node.</p>
+                                <p className="text-slate-500 mb-4">Right-click on the canvas to add the "Project Definition" node.</p>
                             </div>
                         </div>
                     )}
                 </div>
 
-                {/* Right Panel: Output */}
-                <div className={`flex-shrink-0 w-96 md:w-[500px] lg:w-[600px] border-l border-slate-200 dark:border-slate-800 transition-all ${!selectedNode ? 'w-0 opacity-0 overflow-hidden' : 'opacity-100'}`}>
-                    {selectedNode && selectedExecutionState && (
-                        <NodeOutputPanel 
-                            nodeId={selectedNode.id}
-                            executionState={selectedExecutionState}
-                            onContinue={handleContinueNode}
-                            onAddSection={handleAddSection}
-                            onUpdateSection={handleUpdateSection}
-                            onDeleteSection={handleDeleteSection}
-                            onRevertVersion={handleRevertVersion}
+                {/* Left Panel: Properties (Floating) */}
+                <div 
+                    className={`absolute top-0 bottom-0 left-0 z-10 border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex shadow-xl ${leftTransitionClass} ${!selectedNode ? 'pointer-events-none' : ''}`}
+                    style={{ width: selectedNode ? leftWidth : 0, opacity: selectedNode ? 1 : 0 }}
+                >
+                    <div className="flex-1 h-full overflow-hidden relative">
+                        {selectedNode && (
+                            <NodeConfigurator 
+                                node={selectedNode}
+                                upstreamSources={upstreamContext.upstreamSources}
+                                inheritedConfig={upstreamContext.effectiveConfig}
+                                onUpdateConfig={handleUpdateConfig}
+                                onRunNode={handleRunNode}
+                                isNodeRunning={selectedNode.status === 'running'}
+                            />
+                        )}
+                    </div>
+                    {/* Resizer */}
+                    {selectedNode && (
+                        <div 
+                            className="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-indigo-500/50 active:bg-indigo-600 z-50 transition-colors"
+                            onMouseDown={startResizingLeft}
                         />
                     )}
+                </div>
+
+                {/* Right Panel: Output (Floating) */}
+                <div 
+                    className={`absolute top-0 bottom-0 right-0 z-10 border-l border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex shadow-xl ${rightTransitionClass} ${!selectedNode ? 'pointer-events-none' : ''}`}
+                    style={{ width: selectedNode ? rightWidth : 0, opacity: selectedNode ? 1 : 0 }}
+                >
+                     {/* Resizer */}
+                    {selectedNode && (
+                        <div 
+                            className="absolute top-0 left-0 w-1.5 h-full cursor-col-resize hover:bg-indigo-500/50 active:bg-indigo-600 z-50 transition-colors"
+                            onMouseDown={startResizingRight}
+                        />
+                    )}
+                    <div className="flex-1 h-full overflow-hidden relative">
+                        {selectedNode && selectedExecutionState && (
+                            <NodeOutputPanel 
+                                nodeId={selectedNode.id}
+                                executionState={selectedExecutionState}
+                                onContinue={handleContinueNode}
+                                onAddSection={handleAddSection}
+                                onUpdateSection={handleUpdateSection}
+                                onDeleteSection={handleDeleteSection}
+                                onRevertVersion={handleRevertVersion}
+                            />
+                        )}
+                    </div>
                 </div>
             </div>
 

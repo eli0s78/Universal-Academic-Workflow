@@ -1,8 +1,7 @@
 
-
-import React, { useMemo, useState, useRef } from 'react';
-import { Config, TaskType, WorkflowNode, InputType, ResearchRequirement, AnalysisLevel, BookToChapterInputType, ChapterReconInputType, ChapterInfusionInputType, AcademicNoteInputType, ChapterGenInputType, OutlineInputType } from '../types';
-import { TASK_TYPE_OPTIONS, INPUT_TYPE_OPTIONS, RESEARCH_REQUIREMENT_OPTIONS, CHAPTER_GEN_RESEARCH_OPTIONS, ANALYSIS_LEVEL_OPTIONS } from '../constants';
+import React, { useMemo, useState, useRef, useEffect } from 'react';
+import { Config, TaskType, WorkflowNode, InputType, ResearchRequirement, AnalysisLevel, BookToChapterInputType, ChapterReconInputType, ChapterInfusionInputType, AcademicNoteInputType, ChapterGenInputType, OutlineInputType, ProjectInputType, CitationVerificationInputType } from '../types';
+import { TASK_TYPE_OPTIONS, INPUT_TYPE_OPTIONS, RESEARCH_REQUIREMENT_OPTIONS, CHAPTER_GEN_RESEARCH_OPTIONS, ANALYSIS_LEVEL_OPTIONS, OUTLINE_RESEARCH_OPTIONS } from '../constants';
 import SparklesIcon from './icons/SparklesIcon';
 import FileUpload from './FileUpload';
 import SpinnerIcon from './icons/SpinnerIcon';
@@ -185,10 +184,17 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
     // Always include Additional Instructions
     fields.add('Additional_Instructions');
 
-    if (task === TaskType.OUTLINE_GENERATION) {
+    if (task === TaskType.PROJECT_DEFINITION) {
+        fields.add('Chapter_Title').add('Chapter_Subtitle').add('Target_Word_Count').add('Output_Language');
+    }
+    else if (task === TaskType.OUTLINE_GENERATION) {
         fields.add('Chapter_Title').add('Chapter_Subtitle').add('Target_Word_Count').add('Research_Requirement');
         if (config.Input_Type === OutlineInputType.TITLE_AND_CONTEXT_DOCUMENT) fields.add('Source_A_File');
-        if (config.Input_Type === OutlineInputType.BIBLIOGRAPHY || hasInheritedBib) fields.add('Core_Bibliography_Files').add('Analysis_Level');
+        // Show Bibliography options if selected OR if inherited context exists
+        if (config.Input_Type === OutlineInputType.BIBLIOGRAPHY || hasInheritedBib) {
+             fields.add('Core_Bibliography_Files');
+             // Analysis Level removed for Outline node as per request (it uses Context Lib pre-processed data)
+        }
     }
     else if (task === TaskType.CHAPTER_GENERATION) {
         fields.add('Chapter_Outline').add('Target_Word_Count').add('Research_Requirement');
@@ -206,12 +212,18 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
     else if (task === TaskType.ACADEMIC_NOTE_GENERATION) {
         fields.add('Chapter_Title').add('Source_B_Files').add('Target_Word_Count').add('Output_Language').add('Analysis_Level');
     }
+    else if (task === TaskType.CONTEXT_PROCESSING) {
+        fields.add('Chapter_Title').add('Chapter_Subtitle').add('Source_B_Files').add('Analysis_Level');
+    }
     else if (task === TaskType.BOOK_TO_CHAPTER_TRANSMUTATION) {
         fields.add('Book_File').add('Target_Word_Count');
     }
     else if (task === TaskType.RED_TEAM_REVIEW) {
         fields.add('Draft_Chapter_Text').add('Core_Bibliography_Files');
         if (!hasInheritedBib) fields.add('Analysis_Level');
+    }
+    else if (task === TaskType.CITATION_VERIFICATION) {
+        fields.add('Draft_Chapter_Text');
     }
     else if (task === TaskType.FINAL_SYNTHESIS) {
         fields.add('Draft_Chapter_Text').add('Red_Team_Review_Text').add('Core_Bibliography_Files');
@@ -227,21 +239,85 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
   const isInputLocked = useMemo(() => {
     if (node.type === TaskType.CHAPTER_GENERATION && upstreamSources['Chapter_Outline']) return true;
     if (node.type === TaskType.RED_TEAM_REVIEW && upstreamSources['Draft_Chapter_Text']) return true;
+    if (node.type === TaskType.CITATION_VERIFICATION && upstreamSources['Draft_Chapter_Text']) return true;
     if (node.type === TaskType.FINAL_SYNTHESIS && upstreamSources['Red_Team_Review_Text']) return true;
+    
+    // Auto-lock Outline Generation to 'BIBLIOGRAPHY' mode if upstream context is provided
+    if (node.type === TaskType.OUTLINE_GENERATION && inheritedConfig.Core_Bibliography) return true;
+    
+    // Lock Project Definition input to Manual (it's the root)
+    if (node.type === TaskType.PROJECT_DEFINITION) return true;
+
     return false;
-  }, [node.type, upstreamSources]);
+  }, [node.type, upstreamSources, inheritedConfig.Core_Bibliography]);
+
+  // Effect to Auto-switch Input Type
+  useEffect(() => {
+    // Force Bibliography mode for Outline if context exists
+    if (node.type === TaskType.OUTLINE_GENERATION && inheritedConfig.Core_Bibliography && config.Input_Type !== OutlineInputType.BIBLIOGRAPHY) {
+        onUpdateConfig(node.id, { Input_Type: OutlineInputType.BIBLIOGRAPHY });
+    }
+    // Force Outline Only mode for Chapter Generation if Outline is inherited (most common workflow)
+    if (node.type === TaskType.CHAPTER_GENERATION && inheritedConfig.Chapter_Outline && config.Input_Type !== ChapterGenInputType.OUTLINE_ONLY) {
+        onUpdateConfig(node.id, { Input_Type: ChapterGenInputType.OUTLINE_ONLY });
+    }
+    // Auto set Project Definition to Manual
+    if (node.type === TaskType.PROJECT_DEFINITION && config.Input_Type !== ProjectInputType.MANUAL_ENTRY) {
+        onUpdateConfig(node.id, { Input_Type: ProjectInputType.MANUAL_ENTRY });
+    }
+    // Auto set Citation Verification to Draft Chapter
+    if (node.type === TaskType.CITATION_VERIFICATION && config.Input_Type !== CitationVerificationInputType.DRAFT_CHAPTER) {
+        onUpdateConfig(node.id, { Input_Type: CitationVerificationInputType.DRAFT_CHAPTER });
+    }
+  }, [node.type, inheritedConfig.Core_Bibliography, inheritedConfig.Chapter_Outline, config.Input_Type, onUpdateConfig, node.id]);
   
-  // Determine actual values to display (inherited overrides local if local is empty/default for flow continuity)
-  // For display purposes in the UI, if inheritedConfig has a value and local config doesn't, we show inherited.
-  // We passed inheritedConfig separately so we can choose to auto-fill or just show indication.
-  // For text fields like Outline, we'll auto-fill for preview.
+  // Determine actual values to display.
+  // Inherited values (from upstream) override local values for display, creating a "Single Source of Truth" effect.
   const displayConfig = { ...config };
+  
+  // Large Text Blocks
   if (inheritedConfig.Chapter_Outline) displayConfig.Chapter_Outline = inheritedConfig.Chapter_Outline;
   if (inheritedConfig.Draft_Chapter_Text) displayConfig.Draft_Chapter_Text = inheritedConfig.Draft_Chapter_Text;
   if (inheritedConfig.Red_Team_Review_Text) displayConfig.Red_Team_Review_Text = inheritedConfig.Red_Team_Review_Text;
   
-  // For Bibliography, it's boolean/token data.
+  // Metadata / Properties (Title, Subtitle, Word Count, etc.)
+  // We check 'upstreamSources' to confirm if a property is actually linked, then use the value from 'inheritedConfig'.
+  // This handles the "Project Definition" inheritance.
+  if (upstreamSources['Chapter_Title']) displayConfig.Chapter_Title = inheritedConfig.Chapter_Title || '';
+  // Subtitle usually follows Title if Title is inherited from Project Definition
+  if (upstreamSources['Chapter_Title'] && inheritedConfig.Chapter_Subtitle) displayConfig.Chapter_Subtitle = inheritedConfig.Chapter_Subtitle;
+  
+  // Note: Target Word Count & Language are often inherited from Project Definition too, 
+  // but upstreamSources might not explicitly tag them unless we check logic in App.tsx. 
+  // However, App.tsx accumulates them into 'inheritedConfig' if they come from Project Definition.
+  // If we are in a node downstream of Project Definition, we should likely respect them.
+  // A simple heuristic: if inheritedConfig has them and we are not Project Def, use them.
+  if (node.type !== TaskType.PROJECT_DEFINITION) {
+      if (inheritedConfig.Target_Word_Count) displayConfig.Target_Word_Count = inheritedConfig.Target_Word_Count;
+      if (inheritedConfig.Output_Language) displayConfig.Output_Language = inheritedConfig.Output_Language;
+      if (inheritedConfig.Additional_Instructions) displayConfig.Additional_Instructions = inheritedConfig.Additional_Instructions;
+  }
+  
   const isBibliographyInherited = !!inheritedConfig.Core_Bibliography;
+
+  const getContextSizeLabel = (text: string) => {
+      const charCount = text.length;
+      const kb = Math.round(charCount / 1024);
+      return `~${kb} KB`;
+  };
+
+  // Determine correct label and options for the Research dropdown
+  let researchLabel = "Research Depth";
+  let researchOptions = RESEARCH_REQUIREMENT_OPTIONS;
+
+  if (node.type === TaskType.OUTLINE_GENERATION) {
+      researchLabel = "Additional Sources Research";
+      researchOptions = OUTLINE_RESEARCH_OPTIONS;
+  } else if (node.type === TaskType.CHAPTER_GENERATION) {
+      researchLabel = "Content Source";
+      // Force the new options specifically for Chapter Generation
+      researchOptions = CHAPTER_GEN_RESEARCH_OPTIONS;
+  }
 
   return (
     <div className="flex flex-col h-full bg-slate-50 dark:bg-slate-950 border-r border-slate-200 dark:border-slate-800">
@@ -253,7 +329,9 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
       <div className="flex-1 overflow-y-auto p-4 space-y-6">
         <form className="space-y-6">
             {/* Input Type Selector (If applicable) */}
-            {hasInputTypeOption && !isInputLocked && (
+            {/* Hidden for Outline Generation as it is context-driven by the workflow */}
+            {/* Hidden for Context Processing as it directly receives data from input port */}
+            {hasInputTypeOption && !isInputLocked && node.type !== TaskType.OUTLINE_GENERATION && node.type !== TaskType.CONTEXT_PROCESSING && (
                 <div>
                     <label htmlFor="Input_Type" className={labelClass}>Input Method</label>
                     <select id="Input_Type" name="Input_Type" className={commonInputClass} value={config.Input_Type} onChange={handleInputChange} disabled={isNodeRunning}>
@@ -268,17 +346,26 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
                     <span className="text-xs font-semibold uppercase text-indigo-500 block mb-1">Input Source</span>
                     <div className="flex items-center gap-2 text-sm font-medium text-indigo-700 dark:text-indigo-300">
                         <div className="w-2 h-2 rounded-full bg-indigo-500"></div>
-                        <span>Workflow Connected</span>
+                        {node.type === TaskType.PROJECT_DEFINITION ? (
+                            <span>Manual Definition (Root)</span>
+                        ) : (
+                            <span>Workflow Connected (Locked)</span>
+                        )}
                     </div>
+                    {node.type === TaskType.OUTLINE_GENERATION && (
+                        <p className="text-xs text-indigo-600 dark:text-indigo-400 mt-1">
+                            Using upstream context for Gap Analysis.
+                        </p>
+                    )}
                 </div>
             )}
 
             {visibleFields.has('Research_Requirement') && (
                 <div>
-                    <label htmlFor="Research_Requirement" className={labelClass}>Research Depth</label>
+                    <label htmlFor="Research_Requirement" className={labelClass}>{researchLabel}</label>
                     <select id="Research_Requirement" name="Research_Requirement" className={commonInputClass} value={config.Research_Requirement} onChange={handleInputChange} disabled={isNodeRunning}>
-                         <option value="">Select depth...</option>
-                         {(config.Input_Type === ChapterGenInputType.OUTLINE_ONLY ? CHAPTER_GEN_RESEARCH_OPTIONS : RESEARCH_REQUIREMENT_OPTIONS).map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                         <option value="">Select option...</option>
+                         {researchOptions.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                     </select>
                     <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
                         Controls the AI's <strong>active research behavior</strong> during this specific step.
@@ -292,27 +379,34 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
                     <select id="Analysis_Level" name="Analysis_Level" className={commonInputClass} value={config.Analysis_Level} onChange={handleInputChange} disabled={isNodeRunning}>
                          {ANALYSIS_LEVEL_OPTIONS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                     </select>
+                    {node.type === TaskType.CONTEXT_PROCESSING && (
+                        <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+                            Determines density of the knowledge base created from uploaded files.
+                        </p>
+                    )}
                 </div>
             )}
 
             {visibleFields.has('Chapter_Title') && (
                 <div>
-                     {upstreamSources['Chapter_Title'] && !config.Chapter_Title && (
+                     {upstreamSources['Chapter_Title'] && (
                         <div className="text-xs text-blue-600 dark:text-blue-400 mb-1 flex items-center gap-1">
                              <PinIcon className="w-3 h-3" />
                              <span>Inheriting title from {upstreamSources['Chapter_Title']}</span>
                         </div>
                     )}
-                    <label htmlFor="Chapter_Title" className={labelClass}>Title</label>
+                    <label htmlFor="Chapter_Title" className={labelClass}>
+                        {node.type === TaskType.CONTEXT_PROCESSING ? "Context Scope (Inherit from Project Node)" : "Title"}
+                    </label>
                     <input 
                         type="text" 
                         id="Chapter_Title" 
                         name="Chapter_Title" 
                         className={commonInputClass} 
-                        value={config.Chapter_Title} 
+                        value={displayConfig.Chapter_Title} 
                         onChange={handleInputChange} 
-                        disabled={isNodeRunning} 
-                        placeholder={upstreamSources['Chapter_Title'] ? `Inherited: ${inheritedConfig.Chapter_Title || "(from upstream)"}` : "Leave empty to auto-generate title"} 
+                        disabled={isNodeRunning || !!upstreamSources['Chapter_Title']} 
+                        placeholder={upstreamSources['Chapter_Title'] ? `Inherited: ${inheritedConfig.Chapter_Title || "(from upstream)"}` : "Topic or Title to focus extraction..."} 
                     />
                 </div>
             )}
@@ -320,14 +414,48 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
             {visibleFields.has('Chapter_Subtitle') && (
                 <div>
                     <label htmlFor="Chapter_Subtitle" className={labelClass}>Subtitle</label>
-                    <input type="text" id="Chapter_Subtitle" name="Chapter_Subtitle" className={commonInputClass} value={config.Chapter_Subtitle} onChange={handleInputChange} disabled={isNodeRunning} />
+                    <input 
+                        type="text" 
+                        id="Chapter_Subtitle" 
+                        name="Chapter_Subtitle" 
+                        className={commonInputClass} 
+                        value={displayConfig.Chapter_Subtitle} 
+                        onChange={handleInputChange} 
+                        disabled={isNodeRunning || !!upstreamSources['Chapter_Title']} // If Title inherited, usually Subtitle is too
+                        placeholder="Subtitle or secondary focus..."
+                    />
                 </div>
             )}
+            
+            {visibleFields.has('Output_Language') && (
+                <div>
+                   <label htmlFor="Output_Language" className={labelClass}>Output Language</label>
+                   <input 
+                        type="text" 
+                        id="Output_Language" 
+                        name="Output_Language" 
+                        className={commonInputClass} 
+                        placeholder="e.g. English, French (Default: English)" 
+                        value={displayConfig.Output_Language} 
+                        onChange={handleInputChange} 
+                        disabled={isNodeRunning || (!!inheritedConfig.Output_Language && node.type !== TaskType.PROJECT_DEFINITION)}
+                    />
+               </div>
+           )}
 
             {visibleFields.has('Target_Word_Count') && (
                  <div>
                     <label htmlFor="Target_Word_Count" className={labelClass}>Target Word Count</label>
-                    <input type="text" id="Target_Word_Count" name="Target_Word_Count" className={commonInputClass} placeholder="e.g. 3000" value={config.Target_Word_Count} onChange={handleInputChange} disabled={isNodeRunning}/>
+                    <input 
+                        type="text" 
+                        id="Target_Word_Count" 
+                        name="Target_Word_Count" 
+                        className={commonInputClass} 
+                        placeholder="e.g. 3000" 
+                        value={displayConfig.Target_Word_Count} 
+                        onChange={handleInputChange} 
+                        disabled={isNodeRunning || (!!inheritedConfig.Target_Word_Count && node.type !== TaskType.PROJECT_DEFINITION)}
+                    />
                 </div>
             )}
 
@@ -350,18 +478,23 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
             
             {visibleFields.has('Source_B_Files') && (
                 <>
-                    {upstreamSources['Source_B_Content'] && (
+                    {upstreamSources['Source_B_Content'] && node.type !== TaskType.CONTEXT_PROCESSING && (
                         <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-3 mb-4">
-                             <div className="flex items-center gap-2 text-blue-800 dark:text-blue-200 text-sm font-medium">
-                                 <PinIcon className="w-4 h-4" />
-                                 <span>Input from Workflow Linked</span>
+                             <div className="flex justify-between items-start">
+                                 <div className="flex items-center gap-2 text-blue-800 dark:text-blue-200 text-sm font-medium">
+                                     <PinIcon className="w-4 h-4" />
+                                     <span>Input from Workflow Linked</span>
+                                 </div>
+                                 <span className="text-[10px] bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200 px-1.5 py-0.5 rounded">
+                                     {getContextSizeLabel(inheritedConfig.Source_B_Content || '')}
+                                 </span>
                              </div>
-                             <p className="text-xs text-blue-600 dark:text-blue-300 mt-1 ml-6">From node: {upstreamSources['Source_B_Content']}</p>
+                             <p className="text-xs text-blue-600 dark:text-blue-300 mt-1 ml-6 truncate">Source: {upstreamSources['Source_B_Content']}</p>
                         </div>
                     )}
                     <FileUpload 
                         id="Source_B_Files" 
-                        label={node.type === TaskType.ACADEMIC_NOTE_GENERATION ? "Source Documents" : "Secondary Sources"} 
+                        label={node.type === TaskType.ACADEMIC_NOTE_GENERATION ? "Source Documents" : node.type === TaskType.CONTEXT_PROCESSING ? "Library Batch (PDF/DOCX)" : "Secondary Sources"} 
                         onFilesUploaded={(files) => onUpdateConfig(node.id, { Source_B_Files: files })} 
                         disabled={isNodeRunning} 
                         multiple 
@@ -375,12 +508,17 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
             {visibleFields.has('Core_Bibliography_Files') && (
                  isBibliographyInherited ? (
                      <div className="bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 rounded-lg p-3">
-                         <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-200 text-sm font-medium">
-                             <CheckIcon className="w-4 h-4" />
-                             <span>Tokenized Bibliography Linked</span>
+                         <div className="flex justify-between items-start">
+                            <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-200 text-sm font-medium">
+                                <CheckIcon className="w-4 h-4" />
+                                <span>Tokenized Bibliography Linked</span>
+                            </div>
+                            <span className="text-[10px] bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200 px-1.5 py-0.5 rounded">
+                                {getContextSizeLabel(inheritedConfig.Core_Bibliography || '')}
+                            </span>
                          </div>
-                         <p className="text-xs text-emerald-600 dark:text-emerald-300 mt-1 ml-6">
-                            Data pre-processed by {upstreamSources['Core_Bibliography'] || 'upstream node'}.
+                         <p className="text-xs text-emerald-600 dark:text-emerald-300 mt-1 ml-6 truncate">
+                            Source: {upstreamSources['Core_Bibliography'] || 'upstream node'}
                          </p>
                      </div>
                  ) : (
@@ -404,7 +542,7 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
                             value={displayConfig.Chapter_Outline} 
                             onChange={handleInputChange} 
                             rows={6} 
-                            disabled={isNodeRunning} 
+                            disabled={isNodeRunning || !!upstreamSources['Chapter_Outline']} 
                             sourceName={upstreamSources['Chapter_Outline']} 
                             onDrop={handleOutlineDrop}
                             onDragOver={handleOutlineDragOver}
@@ -427,13 +565,13 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
                  ) : (
                  <div>
                      <MemoizedTextArea 
-                        label="Draft Text" 
+                        label={node.type === TaskType.CITATION_VERIFICATION ? "Draft Chapter to Verify" : "Draft Text"} 
                         id="Draft_Chapter_Text" 
                         name="Draft_Chapter_Text" 
                         value={displayConfig.Draft_Chapter_Text} 
                         onChange={handleInputChange} 
                         rows={8} 
-                        disabled={isNodeRunning}
+                        disabled={isNodeRunning || !!upstreamSources['Draft_Chapter_Text']}
                         sourceName={upstreamSources['Draft_Chapter_Text']}
                         onDrop={handleDraftDrop}
                         onDragOver={handleDraftDragOver}
@@ -471,7 +609,7 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
                     value={displayConfig.Red_Team_Review_Text} 
                     onChange={handleInputChange} 
                     rows={6} 
-                    disabled={isNodeRunning} 
+                    disabled={isNodeRunning || !!upstreamSources['Red_Team_Review_Text']} 
                     sourceName={upstreamSources['Red_Team_Review_Text']}
                 />
             )}
@@ -479,13 +617,13 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
              {/* Instructions always editable and independent */}
              {visibleFields.has('Additional_Instructions') && (
                  <MemoizedTextArea 
-                    label="Instructions" 
+                    label={node.type === TaskType.PROJECT_DEFINITION ? "Global Instructions / Charter" : "Instructions"} 
                     id="Additional_Instructions" 
                     name="Additional_Instructions" 
-                    value={config.Additional_Instructions} 
+                    value={displayConfig.Additional_Instructions} 
                     onChange={handleInputChange} 
                     rows={3} 
-                    disabled={isNodeRunning} 
+                    disabled={isNodeRunning || (!!inheritedConfig.Additional_Instructions && node.type !== TaskType.PROJECT_DEFINITION)} 
                     placeholder="Specific guidance for this step..."
                 />
             )}
@@ -507,7 +645,7 @@ const NodeConfigurator: React.FC<NodeConfiguratorProps> = ({ node, upstreamSourc
             ) : (
                 <>
                 <SparklesIcon className="h-5 w-5" />
-                <span>Run Node</span>
+                <span>{node.type === TaskType.PROJECT_DEFINITION ? "Confirm Project Charter" : "Run Node"}</span>
                 </>
             )}
         </button>

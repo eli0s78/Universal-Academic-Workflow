@@ -1,6 +1,6 @@
 
-import { GoogleGenAI, Chat, GenerateContentResponse } from "@google/genai";
-import { Config, ResearchRequirement, TaskType, FileData, Phase, AnalysisLevel } from '../types';
+import { GoogleGenAI } from "@google/genai";
+import { Config, ResearchRequirement, TaskType, FileData, Phase, AnalysisLevel, TokenUsage } from '../types';
 import { MASTER_PROMPT, WORKFLOW_PROTOCOLS, UNIVERSAL_OVERRIDE_INSTRUCTION } from '../constants';
 
 const isRetryableError = (error: any): boolean => {
@@ -31,7 +31,7 @@ const withRetry = async <T>(fn: () => Promise<T>, maxRetries = 3, initialDelay =
 };
 
 
-const chats: Record<string, Chat> = {};
+const chats: Record<string, any> = {};
 let ai: GoogleGenAI | null = null;
 
 export function buildConfigYaml(config: Config, phase: Phase): string {
@@ -54,6 +54,7 @@ export function buildConfigYaml(config: Config, phase: Phase): string {
             Book_File: config.Book_File,
             Core_Bibliography: config.Core_Bibliography, // This will be the processed string content
             Chapter_Outline: config.Chapter_Outline,
+            Draft_Chapter_Text: config.Draft_Chapter_Text // Included for Citation Verification
         };
         break;
     case 'review':
@@ -104,6 +105,8 @@ function getRelevantProtocol(taskType: TaskType | "RED_TEAM_REVIEW" | "FINAL_SYN
         [TaskType.BOOK_TO_CHAPTER_TRANSMUTATION]: "Protocol D: BOOK_TO_CHAPTER_TRANSMUTATION",
         [TaskType.CHAPTER_INFUSION]: "Protocol G: CHAPTER_INFUSION",
         [TaskType.ACADEMIC_NOTE_GENERATION]: "Protocol H: ACADEMIC_NOTE_GENERATION",
+        [TaskType.CONTEXT_PROCESSING]: "Protocol I: CONTEXT_PROCESSING",
+        [TaskType.CITATION_VERIFICATION]: "Protocol K: CITATION_VERIFICATION",
         "RED_TEAM_REVIEW": "Protocol E: RED_TEAM_REVIEW",
         "FINAL_SYNTHESIS": "Protocol F: FINAL_SYNTHESIS",
     };
@@ -138,18 +141,109 @@ const chunkText = (text: string, chunkSize: number): string[] => {
     return chunks;
 };
 
+// Helper for concurrency control
+async function pLimit<T>(concurrency: number, tasks: (() => Promise<T>)[]): Promise<T[]> {
+    const results: T[] = [];
+    const executing: Promise<void>[] = [];
+    
+    for (const task of tasks) {
+        const p = task().then(result => {
+            results.push(result);
+        });
+        executing.push(p);
+        
+        if (executing.length >= concurrency) {
+            await Promise.race(executing);
+            // Clean up finished promises
+            // In a real implementation we'd manage the array index, but Promise.race is tricky for simple removal.
+            // Simplified: Wait for one, then continue. Note: this isn't perfect optimal scheduling but works for small batches.
+            // Better: remove completed from `executing`.
+        }
+        
+        // Removal logic
+        p.finally(() => {
+            const idx = executing.indexOf(p);
+            if (idx !== -1) executing.splice(idx, 1);
+        });
+    }
+    
+    await Promise.all(executing);
+    return results;
+}
+
+
 export const extractRelevantContent = async (
     files: FileData[],
     scope: { contextText: string; instructions?: string },
     analysisLevel: AnalysisLevel | ""
-): Promise<string> => {
+): Promise<{ text: string, usage: TokenUsage }> => {
     if (!process.env.API_KEY) {
         throw new Error("API_KEY environment variable not set");
     }
 
     const localAi = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const MAX_CHARS_PER_CHUNK = 100000;
+    const INTER_REQUEST_DELAY = 200; 
+
+    // Define the processing function for a SINGLE file
+    const processFile = async (file: FileData): Promise<{ text: string, usage: TokenUsage }> => {
+        let synthesizedFromFile = '';
+        let fileUsage: TokenUsage = { promptTokens: 0, responseTokens: 0, totalTokens: 0 };
+        
+        const chunks = chunkText(file.content, MAX_CHARS_PER_CHUNK);
+        
+        for (const chunk of chunks) {
+             const prompt = generateExtractionPrompt(chunk, scope, analysisLevel);
+             try {
+                // Use gemini-3-flash-preview for speed
+                const response: any = await withRetry(() => localAi.models.generateContent({
+                    model: 'gemini-3-flash-preview',
+                    contents: prompt,
+                }));
+                synthesizedFromFile += (response.text || '') + '\n';
+                
+                if (response.usageMetadata) {
+                    fileUsage.promptTokens += response.usageMetadata.promptTokenCount || 0;
+                    fileUsage.responseTokens += response.usageMetadata.candidatesTokenCount || 0;
+                    fileUsage.totalTokens += response.usageMetadata.totalTokenCount || 0;
+                }
+            } catch (error) {
+                console.error(`Error processing chunk from document ${file.name}:`, error);
+                synthesizedFromFile += `--- Error processing a chunk from this document ---\n`;
+            }
+             await new Promise(resolve => setTimeout(resolve, INTER_REQUEST_DELAY));
+        }
+        return { 
+            text: `--- From document: ${file.name} ---\n${synthesizedFromFile.trim()}\n\n`,
+            usage: fileUsage
+        };
+    };
+
+    // Parallelize file processing
+    // Batch size of 3 is a safe middle ground for browser + API limits
+    const tasks = files.map(file => () => processFile(file));
     
-    const extractionPromptTemplate = (documentChunk: string) => {
+    // Simple custom concurrent execution since we don't have p-limit library
+    const BATCH_SIZE = 3;
+    let results: { text: string, usage: TokenUsage }[] = [];
+    
+    for (let i = 0; i < tasks.length; i += BATCH_SIZE) {
+        const batch = tasks.slice(i, i + BATCH_SIZE);
+        const batchResults = await Promise.all(batch.map(t => t()));
+        results = results.concat(batchResults);
+    }
+    
+    const aggregatedText = results.map(r => r.text).join('');
+    const aggregatedUsage = results.reduce((acc, curr) => ({
+        promptTokens: acc.promptTokens + curr.usage.promptTokens,
+        responseTokens: acc.responseTokens + curr.usage.responseTokens,
+        totalTokens: acc.totalTokens + curr.usage.totalTokens
+    }), { promptTokens: 0, responseTokens: 0, totalTokens: 0 });
+
+    return { text: aggregatedText, usage: aggregatedUsage };
+};
+
+const generateExtractionPrompt = (documentChunk: string, scope: { contextText: string; instructions?: string }, analysisLevel: AnalysisLevel | "") => {
         const effectiveAnalysisLevel = analysisLevel || AnalysisLevel.FOCUSED_BALANCE;
         
         let analysisInstruction = '';
@@ -205,39 +299,9 @@ ${documentChunk}
 4.  Extract and synthesize the relevant content.
 5.  Combine the extracted information into a single, cohesive output. Do not add any commentary, introductions, or meta-discussion. Your output should be ONLY the processed content.
     `;
-    };
-    
-    let synthesizedContent = '';
-    const MAX_CHARS_PER_CHUNK = 100000; // Reduced chunk size for Flash compatibility and stability
-    const INTER_REQUEST_DELAY = 500; // Add a 500ms delay between requests to avoid micro-limits
-
-    for (const file of files) {
-        let synthesizedFromFile = '';
-        const chunks = chunkText(file.content, MAX_CHARS_PER_CHUNK);
-        
-        for (const chunk of chunks) {
-            const prompt = extractionPromptTemplate(chunk);
-            try {
-                // Use gemini-2.5-flash for extraction tasks to ensure higher availability and lower latency for bulk processing
-                const response: GenerateContentResponse = await withRetry(() => localAi.models.generateContent({
-                    model: 'gemini-2.5-flash',
-                    contents: prompt,
-                }));
-                synthesizedFromFile += response.text + '\n';
-            } catch (error) {
-                console.error(`Error processing chunk from document ${file.name}:`, error);
-                synthesizedFromFile += `--- Error processing a chunk from this document ---\n`;
-            }
-            // Add a delay after each request to avoid hitting micro-limits
-            await new Promise(resolve => setTimeout(resolve, INTER_REQUEST_DELAY));
-        }
-        synthesizedContent += `--- From document: ${file.name} ---\n${synthesizedFromFile.trim()}\n\n`;
-    }
-    
-    return synthesizedContent.trim();
 };
 
-const executePrompt = async (prompt: string, phaseId: string): Promise<GenerateContentResponse> => {
+const executePrompt = async (prompt: string, phaseId: string): Promise<any> => {
     const chat = chats[phaseId];
     if (!chat) {
         throw new Error(`Workflow has not been started for phase ${phaseId}. Call startPhase first.`);
@@ -246,7 +310,7 @@ const executePrompt = async (prompt: string, phaseId: string): Promise<GenerateC
 };
 
 
-export const startGenerationPhase = async (config: Config, phaseId: string): Promise<{ userPrompt: string, response: GenerateContentResponse }> => {
+export const startGenerationPhase = async (config: Config, phaseId: string): Promise<{ userPrompt: string, response: any }> => {
   if (!process.env.API_KEY) {
     throw new Error("API_KEY environment variable not set");
   }
@@ -254,12 +318,17 @@ export const startGenerationPhase = async (config: Config, phaseId: string): Pro
   ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   const modelConfig: { tools?: any[] } = {};
-  if (config.Research_Requirement === ResearchRequirement.FULL_EXTERNAL_RESEARCH) {
+  
+  // Enable Google Search for both Supplemental (Active) and Full External (Deep) research modes
+  // AND ALWAYS for Citation Verification
+  if (config.Research_Requirement === ResearchRequirement.FULL_EXTERNAL_RESEARCH || 
+      config.Research_Requirement === ResearchRequirement.SUPPLEMENTAL_RESEARCH ||
+      config.Task_Type === TaskType.CITATION_VERIFICATION) {
     modelConfig.tools = [{googleSearch: {}}];
   }
 
   chats[phaseId] = ai.chats.create({
-    model: 'gemini-3-pro-preview',
+    model: 'gemini-3.1-pro-preview',
     config: modelConfig,
   });
 
@@ -275,11 +344,11 @@ export const startGenerationPhase = async (config: Config, phaseId: string): Pro
   };
 };
 
-export const executeReviewPhase = async (config: Config, phaseId: string): Promise<{ userPrompt: string, response: GenerateContentResponse }> => {
+export const executeReviewPhase = async (config: Config, phaseId: string): Promise<{ userPrompt: string, response: any }> => {
     if (!process.env.API_KEY) throw new Error("API_KEY environment variable not set");
     
     ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    chats[phaseId] = ai.chats.create({ model: 'gemini-3-pro-preview' });
+    chats[phaseId] = ai.chats.create({ model: 'gemini-3.1-pro-preview' });
 
     const configYaml = buildConfigYaml(config, 'review');
     const relevantProtocols = getRelevantProtocol("RED_TEAM_REVIEW");
@@ -288,13 +357,13 @@ export const executeReviewPhase = async (config: Config, phaseId: string): Promi
     return { userPrompt: configYaml, response };
 };
 
-export const executeSynthesisPhase = async (config: Config, phaseId: string): Promise<{ userPrompt: string, response: GenerateContentResponse }> => {
+export const executeSynthesisPhase = async (config: Config, phaseId: string): Promise<{ userPrompt: string, response: any }> => {
     if (!process.env.API_KEY) throw new Error("API_KEY environment variable not set");
     
     // Always create a fresh instance and chat for the Synthesis phase to ensure clean context
     // and support the multi-step sequential protocol correctly.
     ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    chats[phaseId] = ai.chats.create({ model: 'gemini-3-pro-preview' });
+    chats[phaseId] = ai.chats.create({ model: 'gemini-3.1-pro-preview' });
 
     const configYaml = buildConfigYaml(config, 'synthesis');
     const relevantProtocols = getRelevantProtocol("FINAL_SYNTHESIS");
@@ -303,7 +372,7 @@ export const executeSynthesisPhase = async (config: Config, phaseId: string): Pr
     return { userPrompt: configYaml, response };
 };
 
-export const continueWorkflow = async (userMessage: string, phaseId: string): Promise<GenerateContentResponse> => {
+export const continueWorkflow = async (userMessage: string, phaseId: string): Promise<any> => {
   const chat = chats[phaseId];
   if (!chat) {
     throw new Error(`Workflow has not been started for phase ${phaseId}. Call startPhase first.`);
